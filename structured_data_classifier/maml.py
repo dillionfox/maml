@@ -19,7 +19,7 @@ class MAML:
         """ must call construct_model() after initializing MAML! """
         self.dim_input = dim_input
         self.dim_output = dim_output
-        self.update_lr = FLAGS.update_lr
+        self.update_lr = FLAGS.alpha
         self.meta_lr = tf.placeholder_with_default(FLAGS.meta_lr, ())
         self.classification = False
         self.test_num_updates = test_num_updates
@@ -96,7 +96,7 @@ class MAML:
                 task_outputbs.append(output)
                 task_lossesb.append(self.loss_func(output, labelb))
 
-                for j in range(num_updates - 1):
+                for j in range(num_updates - 1): # does not enter
                     loss = self.loss_func(self.forward(inputa, fast_weights, reuse=True), labela)
                     grads = tf.gradients(loss, list(fast_weights.values()))
                     if FLAGS.stop_grad:
