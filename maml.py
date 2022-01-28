@@ -21,6 +21,14 @@ class ClinicalDataModel:
         self.model = None
         self._build_model()
 
+    @property
+    def train_x(self):
+        return self.general_train_x
+
+    @property
+    def train_y(self):
+        return self.general_train_y
+
     def __str__(self):
         return """
         This class stores the data required for Model Agnostic Meta-Learning
@@ -38,10 +46,10 @@ class ClinicalDataModel:
 
     def _build_model(self):
         clf = ak.StructuredDataClassifier(overwrite=True, max_trials=3)
-        clf.fit(x=self.general_train_x, y=self.general_train_y, epochs=10)
-        predicted_y = clf.predict(self.test_x)
+        clf.fit(x=self.general_train_x, y=self.general_train_y, epochs=10, verbose=0)
+        predicted_y = clf.predict(self.test_x, verbose=0)
         self.train_accuracy = accuracy_score(self.test_y, predicted_y)
-        clf.evaluate(x=self.test_x, y=self.test_y)
+        # clf.evaluate(x=self.test_x, y=self.test_y)
         self.model = clf.export_model()
         self.theta = self.model.trainable_weights
 
@@ -62,8 +70,9 @@ class MAML:
         self.meta_batch_size = tf.cast(25.0, dtype=tf.float32)
         self.num_updates = 5
         self.num_epochs = 100
+        self.n_chunks = 5
         self._optimizer = keras.optimizers.SGD
-        self._loss_func = keras.losses.BinaryCrossentropy(from_logits=True)
+        self._loss_func = keras.losses.BinaryCrossentropy()
         self.train_accuracy = None
         self.test_accuracy = None
         self.train_loss = None
@@ -75,49 +84,49 @@ class MAML:
 
     def execute(self):
 
-        optimizer = self._optimizer()
+        # Initialize theta
         theta = self.clinical_data.theta
+
+        # Initialize meta-update optimizer
+        optimizer_meta_update = self._optimizer(learning_rate=self.beta)
+
+        # Break up data into chunks
+        index_chunk_list = np.array_split(self.clinical_data.train_x.index, self.n_chunks)
 
         # Execute outer loop
         for epoch in range(self.num_epochs):
-
-            with tf.GradientTape() as tape:
-                # Chunk up the data set into meta_batch_size sets and run them all.
-                results = tf.map_fn(self._meta_learn_step,
-                                    elems=(self.clinical_data.train_x, self.clinical_data.train_y,
-                                           self.clinical_data.test_x, self.clinical_data.test_y,
-                                           theta),
-                                    dtype=self._meta_learn_out_type,
-                                    parallel_iterations=self.meta_batch_size)
-
-                # Unpack results
-                train_loss, test_loss = results[0], results[1]
-                train_accuracy, test_accuracy = results[2], results[3]
-                sum_losses_theta_prime = sum(results[4])
-
-            # Get gradients of loss wrt the weights.
-            gradients = np.array(tape.gradient(train_loss, sum_losses_theta_prime))
-
-            if epoch == 0:
-                theta = self.beta * gradients
-            else:
-                theta -= self.beta * gradients
-
+            # Chunk up the data set into smaller tasks and compute the gradient of the loss function.
+            # task_gradients_list = [self._meta_learn_step(index_batch) for index_batch in index_chunk_list]
+            # Compute the updated theta w.r.t. the sum of the gradient of the loss functions from the tasks.
+            # theta_series = pd.Series(theta)
+            # theta_series -= pd.concat(task_gradients_list, axis=1).sum(1)
             # Update the weights of the model - this needs to operate on a model object
-            optimizer.apply_gradients(zip(gradients, sum_losses_theta_prime))
+            # optimizer_meta_update.apply_gradients(zip(theta, self.clinical_data.model.trainable_weights))
+            meta_update_loss = sum([self._meta_learn_step(index_batch).numpy() for index_batch in index_chunk_list])
+            meta_update_loss = tf.convert_to_tensor(meta_update_loss, dtype=np.float32, name='loss')
+            print(',,,,,,', type(meta_update_loss), meta_update_loss)
+            loss_fn = self._loss_func
+            with tf.GradientTape() as tape:
+                # Forward propagate the model. This does not update weights.
+                forward_prop_meta_update = self.clinical_data.model(self.clinical_data.train_x)
+                meta_update_loss_fake = loss_fn(self.clinical_data.train_y, forward_prop_meta_update)
+                print('......', type(meta_update_loss_fake), meta_update_loss_fake)
+            gradient_f_theta_prime = tape.gradient(meta_update_loss, self.clinical_data.model.trainable_weights)
+            optimizer_meta_update.apply_gradients(zip(gradient_f_theta_prime,
+                                                      self.clinical_data.model.trainable_weights))
 
-        self.report_metrics()
-
-    def simpler_learn_step(self, data_sets_list):
-        # Pull out the chunks of data passed through the map function.
-        train_x, train_y, test_x, test_y, theta = data_sets_list
+    def _meta_learn_step(self, index_batch):
+        train_x = self.clinical_data.train_x.loc[index_batch]
+        train_y = self.clinical_data.train_y.loc[index_batch]
+        test_x = self.clinical_data.test_x
+        test_y = self.clinical_data.test_y
 
         # Save unmodified copy of training weights. We need this for a gradient later on.
         theta = self.clinical_data.weights
 
         # Make a deep copy of the model object. We're doing this in a parallel map, so we
         # need to be careful not to have multiple workers operating on the same object.
-        model = self.clinical_data.make_new_model()
+        model = keras.models.clone_model(self.clinical_data.model)
 
         # Create new reference to loss function. We don't want any confusion. There are multiple
         # loss function instances in this algorithm.
@@ -144,77 +153,25 @@ class MAML:
 
         # MAML Algorithm 2, line 8.
         # Prepare to compute gradient of loss function w.r.t. theta'.
-        with tf.GradientTape() as tape:
-            # Forward propagate the model
-            forward_prop_meta = model(train_x)
-            # Compute loss function from one step
-            meta_update_loss = loss_fn(train_y, forward_prop_meta)
+        # with tf.GradientTape() as tape:
+        #    # Forward propagate the model
+        #    forward_prop_meta = model(train_x)
+        #    # Compute loss function from one step
+        #    meta_update_loss = loss_fn(train_y, forward_prop_meta)
 
-        # MAML Algorith 2, Line 10.
-        gradient_f_theta_prime = tape.gradient(meta_update_loss, theta)
+        # MAML Algorith 2, Line 10. I feel like this isn't correct, but gradient returns
+        # None when I try to compute the derivative w.r.t. a model with theta weights.
+        # gradient_f_theta_prime = tape.gradient(meta_update_loss, model.trainable_weights)
+        # return pd.Series(gradient_f_theta_prime)
 
-        return gradient_f_theta_prime
-
-    def _meta_learn_step(self, data_sets_list):
-        model = keras.models.clone_model(self.clinical_data.model)
-        train_x, train_y, test_x, test_y = data_sets_list
-        loss_fn = self._loss_func
-        optimizer = self._optimizer
-        train_forward_prop = model(train_x)  # Forward pass
-        train_loss = loss_fn(train_y, train_forward_prop)
-        train_accuracy = accuracy_score(train_y, np.argmax(train_forward_prop.numpy(), axis=1))
-
-        with tf.GradientTape() as tape:
-            gradients = tape.gradient(train_loss, self.clinical_data.weights)
-            optimizer.apply_gradients(zip(gradients, self.clinical_data.weights))
-
-        # !! Need to figure out which pieces of gradients I want to keep.
-        # Initialize theta
-        theta = self.alpha * np.array(gradients)
-
-        # Forward propagate model
-        model.compile(optimizer=optimizer,
-                      loss=loss_fn,
-                      metrics=[keras.metrics.BinaryAccuracy()])
-        training_results = model.fit(x=train_x, y=train_y, epochs=self.num_updates)
-
-        # I know this doesn't work. It's close-ish. But this part is going to be difficult.
-        out = model.output
-        out._id = 0
-        with tf.GradientTape() as tape:
-            gradients = tape.gradient(out, model.trainable_weights)
-        test_accuracy = training_results['binary_accuracy']
-        test_loss = training_results['loss']
-
-        theta -= self.alpha * gradients
-
-        return train_loss, test_loss, train_accuracy, test_accuracy, theta
+        forward_prop_meta = model(train_x)
+        # Compute loss function from one step
+        meta_update_loss = loss_fn(train_y, forward_prop_meta)
+        return meta_update_loss
 
     @staticmethod
     def loss_func(targets, predictions):
         return keras.losses.BinaryCrossentropy(from_logits=True)(targets, predictions)
-
-    def report_metrics(self):
-        total_loss_train = tf.reduce_sum(self.train_loss) / self.meta_batch_size
-        total_loss_test = [tf.reduce_sum(self.test_loss[j]) / self.meta_batch_size for j
-                           in range(self.num_updates)]
-
-        total_accuracy_train = tf.reduce_sum(self.train_accuracy) / self.meta_batch_size
-        total_accuracy_test = [tf.reduce_sum(self.test_accuracy[j]) / self.meta_batch_size for j in
-                               range(self.num_updates)]
-
-        tf.summary.scalar('Pre-update loss', total_loss_train)
-        tf.summary.scalar('Pre-update accuracy', total_accuracy_train)
-
-        for j in range(self.num_updates):
-            tf.summary.scalar('Post-update loss, step ' + str(j + 1), total_loss_test[j])
-            tf.summary.scalar('Post-update accuracy, step ' + str(j + 1), total_accuracy_test[j])
-
-        # Extra metrics
-        self.pretrain_op = self._optimizer(self.beta).minimize(total_loss_train)
-        optimizer = self._optimizer(self.beta)
-        gvs = optimizer.compute_gradients(total_loss_test[self.num_updates - 1])
-        self.meta_train_optimized = optimizer.apply_gradients(gvs)
 
     def _preprocess(self):
         self._meta_learn_out_type = [tf.float32, [tf.float32] * self.num_updates,
@@ -251,3 +208,6 @@ if __name__ == "__main__":
     clinical_data_model = ClinicalDataModel(synthetic_train_x, synthetic_train_y,
                                             X_train, y_train,
                                             X_test, y_test)
+
+    maml = MAML(clinical_data_model)
+    maml.execute()
