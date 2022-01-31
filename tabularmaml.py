@@ -4,17 +4,20 @@ import tensorflow as tf
 from tensorflow import keras
 import autokeras as ak
 from sklearn.metrics import accuracy_score
-from copy import deepcopy
 
 
 class ClinicalDataModel:
-    def __init__(self, general_train_x, general_train_y, specific_train_x, specific_train_y, test_x, test_y):
+    def __init__(self, general_train_x, general_train_y,
+                 specific_train_x, specific_train_y,
+                 test_x, test_y,
+                 n_models=5):
         self.general_train_x = general_train_x
         self.general_train_y = general_train_y
         self.specific_train_x = specific_train_x
         self.specific_train_y = specific_train_y
         self.test_x = test_x
         self.test_y = test_y
+        self.n_models = n_models
         self.pretrained_optimizer = None
         self.meta_trained_optimizer = None
         self.train_accuracy = None
@@ -45,44 +48,48 @@ class ClinicalDataModel:
         """
 
     def _build_model(self):
-        clf = ak.StructuredDataClassifier(overwrite=True, max_trials=3)
+
+        # Use AutoKeras to build and evaluate n models
+        clf = ak.StructuredDataClassifier(overwrite=True, max_trials=self.n_models)
+
+        # Fit the "best" model found by autokeras
         clf.fit(x=self.general_train_x, y=self.general_train_y, epochs=10, verbose=0)
+
+        # Evaluate the training accuracy of the chosen model
         predicted_y = clf.predict(self.test_x, verbose=0)
         self.train_accuracy = accuracy_score(self.test_y, predicted_y)
-        # clf.evaluate(x=self.test_x, y=self.test_y)
+
+        # Export the "best" model
         self.model = clf.export_model()
-        self.theta = self.model.trainable_weights
-
-    @property
-    def weights(self):
-        return self.model.trainable_weights
-
-    def make_new_model(self):
-        return deepcopy(self)
 
 
-class MAML:
+class TabularMAML:
     def __init__(self, clinical_data):
         self.clinical_data = clinical_data
         self.alpha = 0.001
         self.beta = 0.001
-        self.meta_train_iterations = 1000
-        self.meta_batch_size = tf.cast(25.0, dtype=tf.float32)
-        self.num_updates = 5
         self.num_epochs = 100
         self.n_chunks = 5
         self._optimizer = keras.optimizers.SGD
         self._loss_func = keras.losses.BinaryCrossentropy()
         self.train_accuracy = None
         self.test_accuracy = None
-        self.train_loss = None
-        self.test_loss = None
-        self.pretrain_op = None
-        self.meta_train_optimized = None
-        self._meta_learn_out_type = None
-        self._preprocess()
+        self.global_model = None
+        self._execute_meta_learning()
 
-    def execute(self):
+    def __str__(self):
+        return """
+        This class implements Model Agnostic Meta-Learning
+        https://arxiv.org/pdf/1703.03400.pdf
+        
+        Input: ClinicalDataModel object instantiated with tabular data
+        
+        """
+
+    def _execute_transfer_learning(self):
+        pass
+
+    def _execute_meta_learning(self):
 
         # Initialize meta-update optimizer
         optimizer_meta_update = self._optimizer(learning_rate=self.beta)
@@ -92,54 +99,54 @@ class MAML:
         current_model = keras.models.clone_model(self.clinical_data.model)
 
         for epoch in range(self.num_epochs):
+
             # Store weights of current model (theta)
             theta = np.array(current_model.get_weights(), dtype=object)
-            gradient_sum = None
-            print('Epoch {}'.format(epoch))
-            for batch_num, index_chunk in enumerate(index_chunk_list):
-                # Execute one iteration of meta-learning (with theta' weights)
-                meta_updated_model = self._meta_learn_step(current_model, index_chunk)
-                # Forward propagate meta-updated model to compute loss in theta' space
-                with tf.GradientTape() as tape:
-                    # Forward propagate model with theta' weights
-                    meta_update_prediction = meta_updated_model(self.clinical_data.train_x)
-                    # Compute loss w.r.t. theta'
-                    loss_val = self._loss_func(self.clinical_data.train_y, meta_update_prediction)
-                # Reset the model weights back in theta to prepare for the gradient calculation
-                meta_updated_model.set_weights(theta)
-                # Compute gradient w.r.t. theta of loss function w.r.t. theta'. The reason I reset meta_updated_model
-                # weights to theta instead of using current_model, which has theta weights, is because tf is
-                # very picky about gradients and this is the simplest way to make it work.
-                gradient_f_theta_prime = tape.gradient(loss_val, meta_updated_model.trainable_weights)
-                if batch_num == 0:
-                    gradient_sum = gradient_f_theta_prime
-                else:
-                    gradient_sum += gradient_f_theta_prime
+            gradient_sum = self._meta_learn_step(current_model, theta, index_chunk_list)
 
             # Update current_model weights with the gradient
             optimizer_meta_update.apply_gradients(zip(gradient_sum,
                                                       current_model.trainable_weights))
 
-    # def _meta_learn_step(self, index_batch):
-    def _meta_learn_step(self, current_model, index_batch):
+        self.global_model = current_model
+
+    def _meta_learn_step(self, current_model, theta, index_chunk_list):
+        gradient_sum = None
+        for batch_num, index_chunk in enumerate(index_chunk_list):
+
+            # Execute one iteration of meta-learning (with theta' weights)
+            meta_updated_model = self._model_update_step(current_model, index_chunk)
+
+            # Forward propagate meta-updated model to compute loss in theta' space
+            with tf.GradientTape() as tape:
+                # Forward propagate model with theta' weights
+                meta_update_prediction = meta_updated_model(self.clinical_data.train_x)
+                # Compute loss w.r.t. theta'
+                loss_val = self._loss_func(self.clinical_data.train_y, meta_update_prediction)
+
+            # Reset the model weights back in theta to prepare for the gradient calculation
+            meta_updated_model.set_weights(theta)
+
+            # Compute gradient w.r.t. theta of loss function w.r.t. theta'. The reason I reset meta_updated_model
+            # weights to theta instead of using current_model, which has theta weights, is because tf is
+            # very picky about gradients and this is the simplest way to make it work.
+            gradient_f_theta_prime = tape.gradient(loss_val, meta_updated_model.trainable_weights)
+
+            if batch_num == 0:
+                gradient_sum = gradient_f_theta_prime
+            else:
+                gradient_sum += gradient_f_theta_prime
+        return gradient_sum
+
+    def _model_update_step(self, current_model, index_batch):
         train_x = self.clinical_data.train_x.loc[index_batch]
         train_y = self.clinical_data.train_y.loc[index_batch]
         # test_x = self.clinical_data.test_x
         # test_y = self.clinical_data.test_y
 
-        # train_x = self.clinical_data.train_x
-        # train_y = self.clinical_data.train_y
-
-        # Save unmodified copy of training weights. We need this for a gradient later on.
-        # theta = self.clinical_data.weights
-
         # Make a deep copy of the model object. We're doing this in a parallel map, so we
         # need to be careful not to have multiple workers operating on the same object.
         model = keras.models.clone_model(current_model)
-
-        # Create new reference to loss function. We don't want any confusion. There are multiple
-        # loss function instances in this algorithm.
-        loss_fn = self._loss_func
 
         # Instantiate the optimizer with the 'alpha' parameter from MAML Algorith 2, Line 6.
         optimizer_pre_update = self._optimizer(learning_rate=self.alpha)
@@ -150,7 +157,7 @@ class MAML:
             # Forward propagate the model. This does not update weights.
             forward_prop_pre_update = model(train_x)
             # Compute loss function from one step
-            pre_update_loss = loss_fn(train_y, forward_prop_pre_update)
+            pre_update_loss = self._loss_func(train_y, forward_prop_pre_update)
 
         # MAML Algorith 2, Line 5.
         # Stop recording / exit context manager. Reference "tape" to compute the gradient.
@@ -160,33 +167,7 @@ class MAML:
         # Note. The parameter 'Alpha' is accounted for by the optimizer as the learning_rate.
         optimizer_pre_update.apply_gradients(zip(gradient_f_theta, model.trainable_weights))
 
-        # MAML Algorithm 2, line 8.
-        # Prepare to compute gradient of loss function w.r.t. theta'.
-        # with tf.GradientTape() as tape:
-        #    # Forward propagate the model
-        #    forward_prop_meta = model(train_x)
-        #    # Compute loss function from one step
-        #    meta_update_loss = loss_fn(train_y, forward_prop_meta)
-
-        # MAML Algorith 2, Line 10. I feel like this isn't correct, but gradient returns
-        # None when I try to compute the derivative w.r.t. a model with theta weights.
-        # gradient_f_theta_prime = tape.gradient(meta_update_loss, model.trainable_weights)
-        # return pd.Series(gradient_f_theta_prime)
-
-        # forward_prop_meta = model(train_x)
-        # Compute loss function from one step
-        # meta_update_loss = loss_fn(train_y, forward_prop_meta)
-        # return meta_update_loss
         return model
-
-    @staticmethod
-    def loss_func(targets, predictions):
-        return keras.losses.BinaryCrossentropy(from_logits=True)(targets, predictions)
-
-    def _preprocess(self):
-        self._meta_learn_out_type = [tf.float32, [tf.float32] * self.num_updates,
-                                     [tf.float32, [tf.float32] * self.num_updates],
-                                     [tf.float32] * len(self.clinical_data.model.layers)]
 
 
 def generate_fake_datasets(x_df, y):
@@ -219,5 +200,4 @@ if __name__ == "__main__":
                                             X_train, y_train,
                                             X_test, y_test)
 
-    maml = MAML(clinical_data_model)
-    maml.execute()
+    maml = TabularMAML(clinical_data_model)
