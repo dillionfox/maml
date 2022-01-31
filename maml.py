@@ -84,61 +84,58 @@ class MAML:
 
     def execute(self):
 
-        # Initialize theta
-        # theta = self.clinical_data.theta
-
         # Initialize meta-update optimizer
         optimizer_meta_update = self._optimizer(learning_rate=self.beta)
 
         # Break up data into chunks
-        # index_chunk_list = np.array_split(self.clinical_data.train_x.index, self.n_chunks)
-
+        index_chunk_list = np.array_split(self.clinical_data.train_x.index, self.n_chunks)
         current_model = keras.models.clone_model(self.clinical_data.model)
 
-        # Execute outer loop
         for epoch in range(self.num_epochs):
-
             # Store weights of current model (theta)
             theta = np.array(current_model.get_weights(), dtype=object)
+            gradient_sum = None
+            print('Epoch {}'.format(epoch))
+            for batch_num, index_chunk in enumerate(index_chunk_list):
+                # Execute one iteration of meta-learning (with theta' weights)
+                meta_updated_model = self._meta_learn_step(current_model, index_chunk)
+                # Forward propagate meta-updated model to compute loss in theta' space
+                with tf.GradientTape() as tape:
+                    # Forward propagate model with theta' weights
+                    meta_update_prediction = meta_updated_model(self.clinical_data.train_x)
+                    # Compute loss w.r.t. theta'
+                    loss_val = self._loss_func(self.clinical_data.train_y, meta_update_prediction)
+                # Reset the model weights back in theta to prepare for the gradient calculation
+                meta_updated_model.set_weights(theta)
+                # Compute gradient w.r.t. theta of loss function w.r.t. theta'. The reason I reset meta_updated_model
+                # weights to theta instead of using current_model, which has theta weights, is because tf is
+                # very picky about gradients and this is the simplest way to make it work.
+                gradient_f_theta_prime = tape.gradient(loss_val, meta_updated_model.trainable_weights)
+                if batch_num == 0:
+                    gradient_sum = gradient_f_theta_prime
+                else:
+                    gradient_sum += gradient_f_theta_prime
 
-            # Execute one iteration of meta-learning (with theta' weights)
-            meta_updated_model = self._meta_learn_step(current_model)
-
-            # Forward propagate meta-updated model to compute loss in theta' space
-            with tf.GradientTape() as tape:
-
-                # Forward propagate model with theta' weights
-                meta_update_prediction = meta_updated_model(self.clinical_data.train_x)
-
-                # Compute loss w.r.t. theta'
-                loss_val = self._loss_func(self.clinical_data.train_y, meta_update_prediction)
-
-            # Reset the model weights back in theta space to prepare for the gradient calculation
-            meta_updated_model.set_weights(theta)
-
-            # Compute gradient w.r.t. theta of loss w.r.t. theta'
-            gradient_f_theta_prime = tape.gradient(loss_val, meta_updated_model.trainable_weights)
-
-            # Update the model weights with the gradient
-            optimizer_meta_update.apply_gradients(zip(gradient_f_theta_prime,
-                                                      self.clinical_data.model.trainable_weights))
+            # Update current_model weights with the gradient
+            optimizer_meta_update.apply_gradients(zip(gradient_sum,
+                                                      current_model.trainable_weights))
 
     # def _meta_learn_step(self, index_batch):
-    def _meta_learn_step(self, model):
-        # train_x = self.clinical_data.train_x.loc[index_batch]
-        # train_y = self.clinical_data.train_y.loc[index_batch]
+    def _meta_learn_step(self, current_model, index_batch):
+        train_x = self.clinical_data.train_x.loc[index_batch]
+        train_y = self.clinical_data.train_y.loc[index_batch]
         # test_x = self.clinical_data.test_x
         # test_y = self.clinical_data.test_y
 
-        train_x = self.clinical_data.train_x
-        train_y = self.clinical_data.train_y
+        # train_x = self.clinical_data.train_x
+        # train_y = self.clinical_data.train_y
 
         # Save unmodified copy of training weights. We need this for a gradient later on.
         # theta = self.clinical_data.weights
 
         # Make a deep copy of the model object. We're doing this in a parallel map, so we
         # need to be careful not to have multiple workers operating on the same object.
-        # model = keras.models.clone_model(self.clinical_data.model)
+        model = keras.models.clone_model(current_model)
 
         # Create new reference to loss function. We don't want any confusion. There are multiple
         # loss function instances in this algorithm.
